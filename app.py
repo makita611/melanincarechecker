@@ -3,6 +3,13 @@ import cv2
 import numpy as np
 import plotly.graph_objects as go
 import pandas as pd
+from PIL import Image
+
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+    HAS_COORD = True
+except ImportError:
+    HAS_COORD = False
 
 st.set_page_config(
     page_title="メラニンケア 色変化分析",
@@ -15,6 +22,14 @@ STAGE_NAMES = [
     "ステージ2（1〜3ヶ月後）",
     "ステージ3（3〜6ヶ月後）",
 ]
+
+SIZE_OPTIONS = {
+    "小 (300px)": 300,
+    "中 (500px)": 500,
+    "大 (700px)": 700,
+    "特大 (900px)": 900,
+}
+
 
 # ── Image Processing ──────────────────────────────────────────────────────────
 
@@ -35,31 +50,25 @@ def circle_mask(h, w, cx_pct, cy_pct, r_pct):
     return m
 
 def mean_lab(img_bgr, mask):
-    """Mean LAB color (OpenCV float32 scale) within mask."""
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     px  = lab[mask > 0]
     return px.mean(axis=0) if len(px) else np.array([128.0, 128.0, 128.0])
 
 def normalize(img_bgr, src_mean, tgt_mean):
-    """Global LAB shift so src reference skin → tgt reference skin."""
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab += (tgt_mean - src_mean)
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 def darkness_score(img_bgr, mask):
-    """
-    Darkness = 100 - L*  (L* in 0–100).
-    OpenCV L channel is 0–255, so L* = L_cv * 100/255.
-    Higher number = darker / more pigmented.
-    """
+    """Darkness = 100 - L*  (L* in 0–100 scale)."""
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     px  = lab[:, :, 0][mask > 0]
     if not len(px):
         return 0.0
     return round(100.0 - float(px.mean()) * 100.0 / 255.0, 1)
 
-def annotate(img_bgr, ref, tgt, max_w=500):
-    """Draw green reference circle + red target circle, then resize."""
+def draw_circles(img_bgr, ref, tgt):
+    """Draw green (REF) and red (TARGET) circles on a copy of img_bgr."""
     h, w = img_bgr.shape[:2]
     out  = img_bgr.copy()
     for (cx_p, cy_p, r_p), color, label in [
@@ -70,62 +79,132 @@ def annotate(img_bgr, ref, tgt, max_w=500):
         cy = int(cy_p / 100 * h)
         r  = max(2, int(r_p / 100 * min(h, w)))
         cv2.circle(out, (cx, cy), r, color, 2)
-        cv2.putText(out, label, (cx - r, max(cy - r - 4, 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        cv2.putText(out, label, (cx - r, max(cy - r - 4, 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    return out
+
+def annotate_resized(img_bgr, ref, tgt, max_w=420):
+    ann   = draw_circles(img_bgr, ref, tgt)
+    h, w  = ann.shape[:2]
     scale = min(max_w / w, 1.0)
-    out   = cv2.resize(out, (int(w * scale), int(h * scale)))
-    return to_rgb(out)
+    ann   = cv2.resize(ann, (int(w * scale), int(h * scale)))
+    return to_rgb(ann)
 
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+# ── Session state ──────────────────────────────────────────────────────────────
+
+def init_stage(i):
+    for k, v in [
+        (f"rx_{i}", 20), (f"ry_{i}", 20), (f"rr_{i}", 5),
+        (f"tx_{i}", 50), (f"ty_{i}", 55), (f"tr_{i}", 8),
+        (f"last_click_{i}", None),
+    ]:
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+# ── Main UI ───────────────────────────────────────────────────────────────────
 
 st.title("🔬 メラニンケア 色変化分析アプリ")
 st.caption("施術前後の写真をアップロードして、色素の濃さの変化を定量化します。")
 st.markdown("---")
 
-col_left, col_right = st.columns([3, 1])
-with col_left:
-    part_name = st.text_input("施術部位名", value="乳輪", help="例：乳輪、脇、膝、リップ など")
-with col_right:
+# Global settings
+c1, c2, c3 = st.columns([2, 1, 2])
+with c1:
+    part_name = st.text_input("施術部位名", value="乳輪",
+                              help="例：乳輪、脇、膝、リップ、VIO など")
+with c2:
     n_stages = st.radio("ステージ数", [2, 3], horizontal=True)
+with c3:
+    size_label = st.select_slider(
+        "🖼 画像の表示サイズ",
+        options=list(SIZE_OPTIONS.keys()),
+        value="中 (500px)",
+    )
+    display_w = SIZE_OPTIONS[size_label]
 
 st.markdown("---")
 
-uploads    = {}  # {stage_idx: UploadedFile}
-ref_params = {}  # {stage_idx: (cx%, cy%, r%)}
-tgt_params = {}  # {stage_idx: (cx%, cy%, r%)}
+uploads    = {}
+ref_params = {}
+tgt_params = {}
 
 for i in range(n_stages):
-    sname = STAGE_NAMES[i]
-    with st.expander(f"📷 {sname}", expanded=True):
+    init_stage(i)
+
+    with st.expander(f"📷 {STAGE_NAMES[i]}", expanded=True):
         uf = st.file_uploader(
-            f"{sname} の写真", type=["jpg", "jpeg", "png"], key=f"uf_{i}"
+            f"{STAGE_NAMES[i]} の写真", type=["jpg", "jpeg", "png"], key=f"uf_{i}"
         )
         if uf:
-            img = load_bgr(uf)
+            img            = load_bgr(uf)
+            h_orig, w_orig = img.shape[:2]
+            actual_w       = min(w_orig, display_w)
+            actual_h       = int(h_orig * actual_w / w_orig)
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**🟢 基準肌エリア**（施術していない正常な肌）")
-                rx = st.slider("中心X %", 0, 100, 20, key=f"rx_{i}")
-                ry = st.slider("中心Y %", 0, 100, 20, key=f"ry_{i}")
-                rr = st.slider("半径 %",   1,  25,  5, key=f"rr_{i}",
-                               help="画像の短辺に対する割合")
-            with col2:
-                st.markdown("**🔴 対象エリア**（施術部位）")
-                tx = st.slider("中心X %", 0, 100, 50, key=f"tx_{i}")
-                ty = st.slider("中心Y %", 0, 100, 55, key=f"ty_{i}")
-                tr = st.slider("半径 %",   1,  25,  8, key=f"tr_{i}",
-                               help="画像の短辺に対する割合")
+            # Mode toggle — which circle does the next click set?
+            mode = st.radio(
+                "クリックで円の中心を設定",
+                ["🟢 基準肌（REF）を設定中", "🔴 対象部位（TARGET）を設定中"],
+                key=f"mode_{i}",
+                horizontal=True,
+                help="モードを選んで画像をクリックすると、その円の中心が移動します",
+            )
+            is_ref = "REF" in mode
 
-            preview = annotate(img, (rx, ry, rr), (tx, ty, tr), max_w=640)
-            st.image(preview,
-                     caption="緑＝基準肌（REF） / 赤＝対象部位（TARGET）",
-                     use_container_width=True)
+            # Build annotated PIL image from current session state
+            ref = (st.session_state[f"rx_{i}"],
+                   st.session_state[f"ry_{i}"],
+                   st.session_state[f"rr_{i}"])
+            tgt = (st.session_state[f"tx_{i}"],
+                   st.session_state[f"ty_{i}"],
+                   st.session_state[f"tr_{i}"])
+            pil = Image.fromarray(to_rgb(draw_circles(img, ref, tgt)))
+
+            # Clickable image (or fallback static image)
+            if HAS_COORD:
+                coord = streamlit_image_coordinates(pil, key=f"coord_{i}", width=actual_w)
+                if coord and coord != st.session_state[f"last_click_{i}"]:
+                    st.session_state[f"last_click_{i}"] = coord
+                    cx = min(100, max(0, int(coord["x"] / actual_w * 100)))
+                    cy = min(100, max(0, int(coord["y"] / actual_h * 100)))
+                    if is_ref:
+                        st.session_state[f"rx_{i}"] = cx
+                        st.session_state[f"ry_{i}"] = cy
+                    else:
+                        st.session_state[f"tx_{i}"] = cx
+                        st.session_state[f"ty_{i}"] = cy
+                    st.rerun()
+            else:
+                st.image(to_rgb(draw_circles(img, ref, tgt)), width=actual_w)
+                st.warning("streamlit-image-coordinates が未インストールのためクリック選択は無効です。")
+
+            st.caption("緑＝基準肌（REF） ／ 赤＝対象部位（TARGET）　　"
+                       "※ スライダーで位置・半径を微調整できます")
+
+            # Fine-tune sliders (bound to session state via key=)
+            ca, cb = st.columns(2)
+            with ca:
+                st.markdown("**🟢 基準肌（REF）の微調整**")
+                st.slider("中心X %", 0, 100, key=f"rx_{i}")
+                st.slider("中心Y %", 0, 100, key=f"ry_{i}")
+                st.slider("半径 %",   1,  25, key=f"rr_{i}",
+                          help="画像短辺に対する%")
+            with cb:
+                st.markdown("**🔴 対象部位（TARGET）の微調整**")
+                st.slider("中心X %", 0, 100, key=f"tx_{i}")
+                st.slider("中心Y %", 0, 100, key=f"ty_{i}")
+                st.slider("半径 %",   1,  25, key=f"tr_{i}",
+                          help="画像短辺に対する%")
 
             uploads[i]    = uf
-            ref_params[i] = (rx, ry, rr)
-            tgt_params[i] = (tx, ty, tr)
+            ref_params[i] = (st.session_state[f"rx_{i}"],
+                             st.session_state[f"ry_{i}"],
+                             st.session_state[f"rr_{i}"])
+            tgt_params[i] = (st.session_state[f"tx_{i}"],
+                             st.session_state[f"ty_{i}"],
+                             st.session_state[f"tr_{i}"])
         else:
             st.info("写真をアップロードしてください。")
 
@@ -133,25 +212,23 @@ st.markdown("---")
 
 ready = len(uploads) == n_stages
 if not ready:
-    st.caption(f"⬆ 全 {n_stages} ステージの写真をアップロードすると「分析実行」ボタンが有効になります。")
+    st.caption(f"⬆ 全 {n_stages} ステージの写真をアップロードすると「分析実行」が有効になります。")
 
 if st.button("🔬 分析を実行", type="primary", disabled=not ready) and ready:
 
     with st.spinner("画像を正規化して分析中…"):
-
-        # Load all images fresh
         imgs = {i: load_bgr(uf) for i, uf in uploads.items()}
 
-        # Stage 1 reference skin: defines the normalization target
+        # Stage 1 reference skin defines the normalization target
         h0, w0   = imgs[0].shape[:2]
         m0       = circle_mask(h0, w0, *ref_params[0])
         ref0_lab = mean_lab(imgs[0], m0)
 
-        # Normalize stage 2+ so their reference skin matches stage 1
+        # Normalize stage 2+ to match stage 1 reference skin
         normed = {0: imgs[0].copy()}
         for i in range(1, n_stages):
-            h, w   = imgs[i].shape[:2]
-            mi     = circle_mask(h, w, *ref_params[i])
+            h, w      = imgs[i].shape[:2]
+            mi        = circle_mask(h, w, *ref_params[i])
             normed[i] = normalize(imgs[i], mean_lab(imgs[i], mi), ref0_lab)
 
         # Darkness scores on normalized images
@@ -168,11 +245,14 @@ if st.button("🔬 分析を実行", type="primary", disabled=not ready) and rea
     cols = st.columns(n_stages)
     for i, col in enumerate(cols):
         with col:
-            ann = annotate(normed[i], ref_params[i], tgt_params[i], max_w=420)
-            st.image(ann, caption=STAGE_NAMES[i])
-            st.metric("色の濃さ", scores[i],
-                      delta=round(scores[i] - scores[0], 1) if i > 0 else None,
-                      delta_color="inverse")
+            st.image(annotate_resized(normed[i], ref_params[i], tgt_params[i]),
+                     caption=STAGE_NAMES[i])
+            st.metric(
+                "色の濃さ",
+                scores[i],
+                delta=round(scores[i] - scores[0], 1) if i > 0 else None,
+                delta_color="inverse",
+            )
 
     # ── 2. Before / After correction per stage ────────────────────────────────
     st.markdown("## 🔄 補正前後の比較")
@@ -180,10 +260,10 @@ if st.button("🔬 分析を実行", type="primary", disabled=not ready) and rea
         st.markdown(f"**{STAGE_NAMES[i]}**")
         c1, c2 = st.columns(2)
         with c1:
-            st.image(annotate(imgs[i],   ref_params[i], tgt_params[i], max_w=420),
+            st.image(annotate_resized(imgs[i],   ref_params[i], tgt_params[i]),
                      caption="補正前（元画像）")
         with c2:
-            st.image(annotate(normed[i], ref_params[i], tgt_params[i], max_w=420),
+            st.image(annotate_resized(normed[i], ref_params[i], tgt_params[i]),
                      caption="補正後（肌色正規化済み）")
 
     # ── 3. Bar chart ──────────────────────────────────────────────────────────
@@ -193,8 +273,7 @@ if st.button("🔬 分析を実行", type="primary", disabled=not ready) and rea
     bar_colors = ["#1e3c72", "#2a7dd4", "#38a3e8"][:n_stages]
 
     fig = go.Figure(go.Bar(
-        x=labels,
-        y=vals,
+        x=labels, y=vals,
         marker_color=bar_colors,
         text=[str(v) for v in vals],
         textposition="outside",
@@ -202,10 +281,7 @@ if st.button("🔬 分析を実行", type="primary", disabled=not ready) and rea
     ))
     fig.update_layout(
         title=f"【{part_name}】色の濃さ変化（施術前 = {scores[0]}）",
-        yaxis=dict(
-            title="色の濃さ（0＝無色 〜 100＝最濃）",
-            range=[0, 110],
-        ),
+        yaxis=dict(title="色の濃さ（0＝無色 〜 100＝最濃）", range=[0, 110]),
         xaxis_title="ステージ",
         plot_bgcolor="white",
         paper_bgcolor="white",
@@ -214,9 +290,7 @@ if st.button("🔬 分析を実行", type="primary", disabled=not ready) and rea
         showlegend=False,
     )
     fig.add_hline(
-        y=scores[0],
-        line_dash="dot",
-        line_color="#999",
+        y=scores[0], line_dash="dot", line_color="#999",
         annotation_text=f"施術前ベース ({scores[0]})",
         annotation_position="top right",
     )
